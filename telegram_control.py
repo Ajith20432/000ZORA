@@ -3,6 +3,10 @@ from __future__ import annotations
 
 import html
 import logging
+import random
+import threading
+import time
+from collections import defaultdict, deque
 from typing import Any
 
 import requests
@@ -10,8 +14,13 @@ import requests
 from config import CFG
 
 BASE = "https://api.telegram.org/bot{}"
-MAX_MESSAGE = 4000  # Telegram rejects >4096 chars; a long AI note used to make the whole alert silently vanish
+MAX_MESSAGE = 3900  # keep margin below Telegram's 4096-character limit
+POLL_TIMEOUT_SECONDS = 20
+REQUEST_TIMEOUT_SECONDS = 25
+MAX_UPDATES_PER_POLL = 100
+MAX_COMMANDS_PER_MINUTE = 20
 logger = logging.getLogger(__name__)
+_send_lock = threading.Lock()
 
 COMMANDS = [
     ("start", "Bot status / welcome"), ("status", "Full bot status"), ("signal", "Latest signals"),
@@ -21,6 +30,8 @@ COMMANDS = [
     ("ai_usage", "AI API calls today and remaining quota"), ("pause_ai", "Pause AI; use technical indicators only"),
     ("resume_ai", "Resume rate-limited AI inference"), ("set_max_trades", "Set daily trade limit: /set_max_trades 5"),
     ("pause", "Pause new entries"), ("resume", "Resume entries"), ("kill", "Emergency kill switch"),
+    ("trades", "Open trades with prices and PnL"), ("ai_votes", "Latest AI advisory votes"),
+    ("start_bot", "Resume automated trading entries"), ("stop_bot", "Pause automated trading entries"),
     ("help", "Command list"),
 ]
 
@@ -30,10 +41,8 @@ def enabled() -> bool:
 
 
 def _admins() -> set[str]:
-    ids = set(CFG.telegram_admin_chat_ids)
-    if CFG.telegram_chat_id:
-        ids.add(str(CFG.telegram_chat_id))
-    return ids
+    # Admin commands are authorized only by the explicit allow-list.
+    return set(CFG.telegram_admin_chat_ids)
 
 
 def is_admin(chat_id: str | int) -> bool:
@@ -46,20 +55,72 @@ def _api(method: str, **kwargs):
     return requests.post(BASE.format(CFG.telegram_bot_token) + f"/{method}", timeout=10, **kwargs)
 
 
+def _chunks(text: str, limit: int = MAX_MESSAGE) -> list[str]:
+    """Split long Telegram text at line boundaries where possible."""
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if len(current) + len(line) > limit:
+            if current:
+                chunks.append(current)
+            current = line
+        else:
+            current += line
+    if current:
+        chunks.append(current)
+    return chunks or [text[:limit]]
+
+
 def send(text: str, parse_mode: str | None = None) -> None:
+    """Best-effort alert delivery; network/API errors never interrupt trading.
+
+    Long alerts are split rather than silently truncated. HTML callers should
+    keep tags balanced per chunk; trade alerts are deliberately kept short.
+    """
     if not enabled():
         return
-    if len(text) > MAX_MESSAGE:
-        text = text[: MAX_MESSAGE - 1] + "…"
     try:
-        payload = {"chat_id": CFG.telegram_chat_id, "text": text, "disable_web_page_preview": True}
-        if parse_mode:
-            payload["parse_mode"] = parse_mode
-        r = _api("sendMessage", json=payload)
-        if r is not None:
-            r.raise_for_status()
+        with _send_lock:
+            for part in _chunks(str(text)):
+                payload = {"chat_id": CFG.telegram_chat_id, "text": part,
+                           "disable_web_page_preview": True}
+                if parse_mode:
+                    payload["parse_mode"] = parse_mode
+                r = _api("sendMessage", json=payload)
+                if r is not None:
+                    r.raise_for_status()
+                    data = r.json()
+                    if isinstance(data, dict) and data.get("ok") is False:
+                        raise RuntimeError(f"Telegram API rejected sendMessage: {data.get('description', 'unknown error')}")
     except Exception:
         logger.exception("Telegram sendMessage failed; trading loop will continue")
+
+
+def send_health_alert(title: str, details: str, *, severity: str = "INFO") -> None:
+    """Send a concise, HTML-safe operational alert."""
+    sev = str(severity).upper()
+    icon = {"CRITICAL": "🚨", "ERROR": "🔴", "WARNING": "🟠", "INFO": "ℹ️"}.get(sev, "ℹ️")
+    body = f"{icon} <b>ZORA {html.escape(sev)}</b>\n<b>{html.escape(str(title))}</b>\n{html.escape(str(details))[:2500]}"
+    send(body, parse_mode="HTML")
+
+
+def send_heartbeat(status: str, *, equity: float | None = None,
+                   open_positions: int | None = None, mode: str = "PAPER") -> None:
+    """Optional compact heartbeat; caller controls the configured interval."""
+    fields = [f"Mode: {html.escape(str(mode))}", f"Status: {html.escape(str(status))}"]
+    if equity is not None:
+        fields.append(f"Equity: {float(equity):.2f}")
+    if open_positions is not None:
+        fields.append(f"Open positions: {int(open_positions)}")
+    send("💓 <b>ZORA HEARTBEAT</b>\n" + "\n".join(fields), parse_mode="HTML")
 
 
 
@@ -130,23 +191,58 @@ def setup_commands() -> None:
 
 
 class CommandPoller:
+    """Safe long-poll command reader for the legacy ZORA loop.
+
+    Configure TELEGRAM_ADMIN_CHAT_IDS with numeric Telegram user IDs. In a
+    private chat, old installations that provide only chat.id remain supported;
+    in group chats, authorization checks the actual sender's from.id.
+    """
     def __init__(self) -> None:
         self.offset: int | None = None
         self.initialized = False
+        self._seen: set[int] = set()
+        self._seen_order: deque[int] = deque(maxlen=2000)
+        self._rate: dict[str, deque[float]] = defaultdict(deque)
+        self._last_error_log = 0.0
 
     def _get_updates(self) -> list:
-        params = {"timeout": 0, "allowed_updates": ["message"]}
+        params = {"timeout": POLL_TIMEOUT_SECONDS,
+                  "allowed_updates": '["message"]'}
         if self.offset is not None:
             params["offset"] = self.offset
-        r = requests.get(BASE.format(CFG.telegram_bot_token) + "/getUpdates", params=params, timeout=10)
+        r = requests.get(BASE.format(CFG.telegram_bot_token) + "/getUpdates",
+                         params=params, timeout=REQUEST_TIMEOUT_SECONDS)
         r.raise_for_status()
-        return r.json().get("result", [])
+        data = r.json()
+        if not isinstance(data, dict) or data.get("ok") is False:
+            raise RuntimeError("Telegram getUpdates returned an unsuccessful response")
+        result = data.get("result", [])
+        return result if isinstance(result, list) else []
+
+    def _authorized(self, message: dict) -> bool:
+        chat = message.get("chat") or {}
+        sender = message.get("from") or {}
+        chat_id = str(chat.get("id", ""))
+        sender_id = str(sender.get("id", ""))
+        chat_type = str(chat.get("type", "private"))
+        # In groups, never trust chat.id as an admin identity: that would grant
+        # every member of the group control over the bot.
+        if chat_type != "private":
+            return bool(sender_id and is_admin(sender_id))
+        return is_admin(sender_id or chat_id)
+
+    def _within_rate_limit(self, identity: str) -> bool:
+        now = time.monotonic()
+        q = self._rate[identity]
+        while q and now - q[0] >= 60:
+            q.popleft()
+        if len(q) >= MAX_COMMANDS_PER_MINUTE:
+            return False
+        q.append(now)
+        return True
 
     def drain(self) -> int:
-        """
-        Discard commands queued while the bot was offline. Without this a stale "/kill" or "/resume" sent
-        yesterday would execute the moment the bot restarts. Returns how many were dropped.
-        """
+        """Discard stale queued updates at boot to avoid executing old commands."""
         if not enabled():
             return 0
         dropped = 0
@@ -156,12 +252,12 @@ class CommandPoller:
                 if not updates:
                     break
                 for u in updates:
-                    self.offset = u.get("update_id", 0) + 1
+                    self.offset = max(self.offset or 0, int(u.get("update_id", 0)) + 1)
                 dropped += len(updates)
-                if len(updates) < 100:
+                if len(updates) < MAX_UPDATES_PER_POLL:
                     break
         except Exception:
-            pass
+            logger.exception("Telegram update drain failed")
         self.initialized = True
         return dropped
 
@@ -170,18 +266,39 @@ class CommandPoller:
             return []
         try:
             updates = self._get_updates()
-        except Exception:
+        except Exception as exc:
+            # Avoid log spam if Telegram/network remains unavailable.
+            now = time.monotonic()
+            if now - self._last_error_log > 60:
+                logger.warning("Telegram polling unavailable: %s", exc)
+                self._last_error_log = now
             return []
-        commands = []
-        for u in updates:
-            self.offset = u.get("update_id", 0) + 1
-            msg = u.get("message", {})
-            chat_id = str(msg.get("chat", {}).get("id", ""))
+        commands: list[str] = []
+        for update in updates[:MAX_UPDATES_PER_POLL]:
+            try:
+                update_id = int(update.get("update_id", -1))
+            except (TypeError, ValueError):
+                continue
+            self.offset = max(self.offset or 0, update_id + 1)
+            if update_id >= 0 and update_id in self._seen:
+                continue
+            if update_id >= 0:
+                if len(self._seen_order) == self._seen_order.maxlen:
+                    old = self._seen_order.popleft()
+                    self._seen.discard(old)
+                self._seen.add(update_id)
+                self._seen_order.append(update_id)
+            msg = update.get("message") or {}
             text = (msg.get("text") or "").strip()
-            if text:
-                self.initialized = True
-            if not is_admin(chat_id) or not text.startswith("/"):
+            if not text.startswith("/") or not self._authorized(msg):
+                continue
+            identity = str((msg.get("from") or {}).get("id") or (msg.get("chat") or {}).get("id", ""))
+            if not self._within_rate_limit(identity):
+                logger.warning("Telegram command rate limit reached for admin %s", identity)
                 continue
             head, *rest = text.split()
-            commands.append(head.lower() + (" " + " ".join(rest) if rest else ""))
+            # Telegram group commands may be addressed as /status@BotName.
+            head = head.split("@", 1)[0].lower()
+            command = head + (" " + " ".join(rest) if rest else "")
+            commands.append(command)
         return commands
